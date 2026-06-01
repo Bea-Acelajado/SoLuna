@@ -12,8 +12,8 @@ service cloud.firestore {
     // ── Contact Requests ─────────────────────────────────────────
     match /contactRequests/{requestId} {
       allow read: if request.auth != null && (
-        requestId.matches(request.auth.uid + "_.*") ||
-        requestId.matches(".*_" + request.auth.uid)
+        requestId.split('_')[0] == request.auth.uid ||
+        requestId.split('_')[1] == request.auth.uid
       );
       allow create: if request.auth != null &&
         request.resource.data.senderId == request.auth.uid;
@@ -36,31 +36,31 @@ service cloud.firestore {
     // Path: chats/{uid1_uid2}/messages/{msgId}
     match /chats/{chatId}/messages/{msgId} {
       allow read, write: if request.auth != null &&
-        (chatId.matches(request.auth.uid + "_.*") ||
-         chatId.matches(".*_" + request.auth.uid));
+        (chatId.split('_')[0] == request.auth.uid || 
+         chatId.split('_')[1] == request.auth.uid);
     }
 
     // ── Personal Channels (notepad) ───────────────────────────────
     // Path: channels/{uid_channelName}/messages/{msgId}
     match /channels/{channelDoc}/messages/{msgId} {
       allow read, write: if request.auth != null &&
-        channelDoc.matches(request.auth.uid + "_.*");
+        channelDoc.split('_')[0] == request.auth.uid;
     }
 
     // ── Typing Indicators ─────────────────────────────────────────
     // Path: typing/{chatId}  (flat doc, fields keyed by uid)
     match /typing/{chatId} {
       allow read, write: if request.auth != null &&
-        (chatId.matches(request.auth.uid + "_.*") ||
-         chatId.matches(".*_" + request.auth.uid));
+        (chatId.split('_')[0] == request.auth.uid || 
+         chatId.split('_')[1] == request.auth.uid);
     }
 
     // ── Read Receipts ─────────────────────────────────────────────
     // Path: readReceipts/{chatId}  (flat doc, fields keyed by uid)
     match /readReceipts/{chatId} {
       allow read, write: if request.auth != null &&
-        (chatId.matches(request.auth.uid + "_.*") ||
-         chatId.matches(".*_" + request.auth.uid));
+        (chatId.split('_')[0] == request.auth.uid || 
+         chatId.split('_')[1] == request.auth.uid);
     }
   }
 }
