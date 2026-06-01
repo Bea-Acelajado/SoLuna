@@ -1,4 +1,6 @@
 import { useEffect, useState } from "react";
+import { auth } from "../firebase";
+import { signInWithPopup, GoogleAuthProvider } from "firebase/auth";
 
 
 function getTimeframe() {
@@ -25,7 +27,7 @@ function getBackground() {
 }
 
 
-export default function HomePage({ onEnter }) {
+export default function HomePage({ user, onEnter }) {
     const [time, setTime] = useState("");
     const [warp, setWarp] = useState(false);
     const [status, setStatus] = useState("");
@@ -33,8 +35,23 @@ export default function HomePage({ onEnter }) {
         getTimeframe().toUpperCase()
     );
     const background = getBackground();
-    function handleEnter() {
+
+    async function handleEnter() {
         setStatus("AUTHENTICATING...");
+        
+        if (!user) {
+            try {
+                const provider = new GoogleAuthProvider();
+                await signInWithPopup(auth, provider);
+                setStatus("AUTHENTICATION SUCCESSFUL...");
+            } catch (error) {
+                console.error("Sign in failed:", error);
+                setStatus("AUTHENTICATION FAILED. TRY AGAIN.");
+                setTimeout(() => setStatus(""), 3000);
+                return; // Stop the sequence if login fails
+            }
+        }
+
         setTimeout(() => {
             setStatus("CONNECTING TO NEBULAE...");
         }, 500);
