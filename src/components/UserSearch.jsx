@@ -86,12 +86,15 @@ export default function UserSearch({ currentUser, c1, c2 }) {
         setLoading(true);
         setError("");
         setSuccess("");
+        const targetUid = targetUser.uid || targetUser.id;
 
-        const requestId = currentUser.uid < targetUser.uid 
-            ? `${currentUser.uid}_${targetUser.uid}` 
-            : `${targetUser.uid}_${currentUser.uid}`;
+        const requestId = currentUser.uid < targetUid
+            ? `${currentUser.uid}_${targetUid}`
+            : `${targetUid}_${currentUser.uid}`;
 
         try {
+            const contactRef = doc(db, "users", currentUser.uid, "contacts", targetUid);
+
             // Check if request already exists
             const requestRef = doc(db, "contactRequests", requestId);
             const requestSnap = await getDoc(requestRef);
@@ -99,7 +102,16 @@ export default function UserSearch({ currentUser, c1, c2 }) {
             if (requestSnap.exists()) {
                 const data = requestSnap.data();
                 if (data.status === "accepted") {
-                    setError("This entity is already in your contacts.");
+                    await setDoc(contactRef, {
+                        contactUid: targetUid,
+                        email: targetUser.email || data.receiverEmail || data.senderEmail || "",
+                        displayName: targetUser.displayName || targetUser.email?.split("@")[0] || "Unknown",
+                        photoURL: targetUser.photoURL || "",
+                        archived: false,
+                        addedAt: Date.now()
+                    }, { merge: true });
+                    setSuccess(`${targetUser.displayName || "Traveler"} restored to your contacts.`);
+                    setFoundUsers((prev) => prev.filter((u) => u.id !== targetUser.id));
                 } else if (data.status === "pending") {
                     setError(data.senderId === currentUser.uid 
                         ? "Contact request is already pending." 
@@ -111,9 +123,11 @@ export default function UserSearch({ currentUser, c1, c2 }) {
                         senderId: currentUser.uid,
                         senderName: currentUser.displayName || currentUser.email.split("@")[0],
                         senderEmail: currentUser.email,
-                        receiverId: targetUser.uid,
+                        senderPhoto: currentUser.photoURL || "",
+                        receiverId: targetUid,
                         receiverEmail: targetUser.email,
                         receiverName: targetUser.displayName || targetUser.email.split("@")[0],
+                        receiverPhoto: targetUser.photoURL || "",
                         status: "pending",
                         timestamp: Date.now()
                     });
@@ -122,20 +136,31 @@ export default function UserSearch({ currentUser, c1, c2 }) {
                 }
             } else {
                 // Check if they are already in contacts subcollection
-                const contactRef = doc(db, "users", currentUser.uid, "contacts", targetUser.uid);
                 const contactSnap = await getDoc(contactRef);
 
                 if (contactSnap.exists()) {
-                    setError("This entity is already in your contacts.");
+                    const contactData = contactSnap.data();
+                    if (contactData.archived) {
+                        await setDoc(contactRef, {
+                            archived: false,
+                            addedAt: Date.now()
+                        }, { merge: true });
+                        setSuccess(`${targetUser.displayName || "Traveler"} restored to your contacts.`);
+                        setFoundUsers((prev) => prev.filter((u) => u.id !== targetUser.id));
+                    } else {
+                        setError("This entity is already in your contacts.");
+                    }
                 } else {
                     // Create new pending request
                     await setDoc(requestRef, {
                         senderId: currentUser.uid,
                         senderName: currentUser.displayName || currentUser.email.split("@")[0],
                         senderEmail: currentUser.email,
-                        receiverId: targetUser.uid,
+                        senderPhoto: currentUser.photoURL || "",
+                        receiverId: targetUid,
                         receiverEmail: targetUser.email,
                         receiverName: targetUser.displayName || targetUser.email.split("@")[0],
+                        receiverPhoto: targetUser.photoURL || "",
                         status: "pending",
                         timestamp: Date.now()
                     });

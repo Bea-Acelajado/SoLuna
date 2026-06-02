@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { db, auth } from "../firebase";
-import { signOut } from "firebase/auth";
-import { collection, addDoc, query, orderBy, onSnapshot, doc, setDoc, deleteDoc, getDoc } from "firebase/firestore";
+import { signOut, updateProfile } from "firebase/auth";
+import { collection, addDoc, query, orderBy, onSnapshot, doc, setDoc, deleteDoc, getDocs, writeBatch, updateDoc } from "firebase/firestore";
 import { uploadToCloudinary } from "../utils/cloudinary";
 import UserSearch from "../components/UserSearch";
 import ContactRequests from "../components/ContactRequests";
@@ -10,6 +10,17 @@ import ContactsList from "../components/ContactsList";
 
 const CELESTIALS = ["⭐", "🌟", "✨", "🌙", "☀️", "🌌"];
 
+
+const STATUS_OPTIONS = [
+    { value: "online", label: "ONLINE", color: "#36e68a" },
+    { value: "idle", label: "IDLE", color: "#ffd166" },
+    { value: "dnd", label: "DO NOT DISTURB", color: "#ff4d5e" },
+    { value: "offline", label: "OFFLINE", color: "#777" },
+];
+
+const statusColor = (status) => STATUS_OPTIONS.find((option) => option.value === status)?.color || "#777";
+
+const getContactChatId = (uidA, uidB) => (uidA < uidB ? `${uidA}_${uidB}` : `${uidB}_${uidA}`);
 
 function getTimeframe() {
     const hour = new Date().getHours();
@@ -38,13 +49,17 @@ function getColors() {
 
 
 export default function ChatPage({ user }) {
-    const [users, setUsers] = useState(["atlas", "luna", "nova", "orion"]);
+    const [users] = useState(["atlas", "luna", "nova", "orion"]);
     const [messages, setMessages] = useState([]);
     const [input, setInput] = useState("");
     const [search, setSearch] = useState("");
-    const [isTyping, setIsTyping] = useState(false);
+    const [, setIsTyping] = useState(false);
     const typingTimeoutRef = useRef(null);
     const [deleteTarget, setDeleteTarget] = useState(null);
+    const [editTarget, setEditTarget] = useState(null);
+    const [messageEditValue, setMessageEditValue] = useState("");
+    const [replyTarget, setReplyTarget] = useState(null);
+    const [showPinnedMessages, setShowPinnedMessages] = useState(false);
     // Tab and selection states
     const [sidebarTab, setSidebarTab] = useState("nodes"); // "nodes" or "contacts"
     const [selectedUser, setSelectedUser] = useState("atlas"); // node selection
@@ -52,12 +67,28 @@ export default function ChatPage({ user }) {
     const [showRightPanel, setShowRightPanel] = useState(false);
     const [energy, setEnergy] = useState(30);
     const [uploadStatus, setUploadStatus] = useState("");
+    const [profile, setProfile] = useState({
+        displayName: user?.displayName || user?.email?.split("@")[0] || "Traveler",
+        photoURL: user?.photoURL || "",
+        status: "online",
+    });
+    const [profileForm, setProfileForm] = useState({
+        displayName: user?.displayName || user?.email?.split("@")[0] || "Traveler",
+        photoURL: user?.photoURL || "",
+    });
+    const [channelSettings, setChannelSettings] = useState({});
+    const [channelForm, setChannelForm] = useState({ name: "", displayName: "" });
+    const [contactForm, setContactForm] = useState({ nickname: "", displayName: "" });
+    const [contactAction, setContactAction] = useState(null);
     // Modal state for full screen image
     const [enlargedImage, setEnlargedImage] = useState(null);
     // Typing indicator: name of the contact who is currently typing (null = nobody)
     const [peerTyping, setPeerTyping] = useState(null);
     // Read receipt: timestamp when the peer last opened the chat
     const [peerReadTs, setPeerReadTs] = useState(0);
+    const pinnedMessages = messages
+        .filter((message) => message.pinned)
+        .sort((a, b) => (a.time || 0) - (b.time || 0));
 
 
     // Resolve the Firestore path based on active mode:
@@ -65,15 +96,20 @@ export default function ChatPage({ user }) {
     //   (3 path segments = valid Firestore collection depth)
     // - Contacts: shared two-user room → chats/{uid1_uid2}/messages
     const activeCollection = selectedContact
-        ? `chats/${user.uid < selectedContact.uid ? `${user.uid}_${selectedContact.uid}` : `${selectedContact.uid}_${user.uid}`}/messages`
+        ? `chats/${getContactChatId(user.uid, selectedContact.uid)}/messages`
         : selectedUser
             ? `channels/${user.uid}_${selectedUser}/messages`
             : null;
 
     // The chatId for a contact conversation (used for typing + read receipts)
     const contactChatId = selectedContact
-        ? (user.uid < selectedContact.uid ? `${user.uid}_${selectedContact.uid}` : `${selectedContact.uid}_${user.uid}`)
+        ? getContactChatId(user.uid, selectedContact.uid)
         : null;
+
+    const selectedChannelSettings = selectedUser ? channelSettings[selectedUser] || {} : {};
+    const selectedChannelName = selectedUser ? selectedChannelSettings.name || selectedUser : "";
+    const channelDisplayName = selectedChannelSettings.displayName || profile.displayName || user?.displayName || user?.email?.split("@")[0] || "Anonymous";
+    const mainDisplayName = profile.displayName || user?.displayName || user?.email?.split("@")[0] || "Anonymous";
 
 
 
@@ -84,7 +120,7 @@ export default function ChatPage({ user }) {
 
     function renameUser(oldName) {
         setEditingUser(oldName);
-        setEditValue(oldName);
+        setEditValue(channelSettings[oldName]?.name || oldName);
     }
 
 
@@ -94,13 +130,17 @@ export default function ChatPage({ user }) {
 
 
 
-    function saveRename(oldName) {
-        setUsers((prev) =>
-            prev.map((u) => (u === oldName ? editValue : u))
-        );
-        if (selectedUser === oldName) {
-            setSelectedUser(editValue);
+    async function saveRename(oldName) {
+        const nextName = editValue.trim();
+        if (!nextName || !user?.uid) {
+            setEditingUser(null);
+            return;
         }
+
+        await setDoc(doc(db, "users", user.uid, "channels", oldName), {
+            name: nextName,
+            updatedAt: Date.now()
+        }, { merge: true });
         setEditingUser(null);
     }
 
@@ -114,10 +154,99 @@ export default function ChatPage({ user }) {
     const [celestials, setCelestials] = useState([]);
     const canvasRef = useRef(null);
     const imageInputRef = useRef(null);
+    const messagesEndRef = useRef(null);
+    const pinnedMessagesListRef = useRef(null);
     const historyRef = useRef([]);
     const moodRef = useRef("calm");
     const [hoveredMessage, setHoveredMessage] = useState(null);
     const [c1, c2] = getColors();
+
+    useEffect(() => {
+        if (!user?.uid) return;
+
+        const unsubscribe = onSnapshot(doc(db, "users", user.uid), (docSnap) => {
+            if (!docSnap.exists()) return;
+            const data = docSnap.data();
+            const nextProfile = {
+                displayName: data.displayName || user.displayName || user.email?.split("@")[0] || "Traveler",
+                photoURL: data.photoURL || user.photoURL || "",
+                status: data.status || "online",
+            };
+            setProfile(nextProfile);
+            setProfileForm((prev) => ({
+                displayName: prev.displayName || nextProfile.displayName,
+                photoURL: prev.photoURL || nextProfile.photoURL,
+            }));
+        });
+
+        return () => unsubscribe();
+    }, [user]);
+
+    useEffect(() => {
+        if (!user?.uid) return;
+
+        const unsubscribe = onSnapshot(collection(db, "users", user.uid, "channels"), (snap) => {
+            const nextSettings = {};
+            snap.forEach((docSnap) => {
+                nextSettings[docSnap.id] = docSnap.data();
+            });
+            setChannelSettings(nextSettings);
+        });
+
+        return () => unsubscribe();
+    }, [user]);
+
+    useEffect(() => {
+        if (selectedContact) {
+            setContactForm({
+                nickname: selectedContact.nickname || "",
+                displayName: selectedContact.myDisplayName || "",
+            });
+        }
+    }, [selectedContact]);
+
+    useEffect(() => {
+        if (!selectedContact?.uid) return;
+
+        const unsubscribe = onSnapshot(doc(db, "users", selectedContact.uid), (docSnap) => {
+            if (!docSnap.exists()) return;
+            const profileData = docSnap.data();
+            setSelectedContact((prev) => {
+                if (!prev || prev.uid !== selectedContact.uid) return prev;
+                const displayName = prev.nickname || profileData.displayName || prev.contactDisplayName || prev.displayName;
+                return {
+                    ...prev,
+                    ...profileData,
+                    uid: prev.uid,
+                    contactDisplayName: prev.contactDisplayName,
+                    nickname: prev.nickname,
+                    myDisplayName: prev.myDisplayName,
+                    displayName,
+                    photoURL: profileData.photoURL || prev.photoURL || "",
+                    status: profileData.status || "offline",
+                };
+            });
+        });
+
+        return () => unsubscribe();
+    }, [selectedContact?.uid]);
+
+    useEffect(() => {
+        if (selectedUser) {
+            const settings = channelSettings[selectedUser] || {};
+            setChannelForm({
+                name: settings.name || selectedUser,
+                displayName: settings.displayName || "",
+            });
+        }
+    }, [selectedUser, channelSettings]);
+
+    useEffect(() => {
+        setProfileForm({
+            displayName: profile.displayName || user?.displayName || user?.email?.split("@")[0] || "Traveler",
+            photoURL: profile.photoURL || user?.photoURL || "",
+        });
+    }, [profile.displayName, profile.photoURL, user]);
 
 
 
@@ -162,9 +291,24 @@ export default function ChatPage({ user }) {
 
         return () => {
             setMessages([]); // clear stale messages when switching away
+            setReplyTarget(null);
+            setEditTarget(null);
+            setMessageEditValue("");
             unsubscribe();
         };
     }, [activeCollection]);
+
+    useEffect(() => {
+        messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    }, [messages.length, activeCollection]);
+
+    useEffect(() => {
+        if (!showPinnedMessages) return;
+        const pinnedList = pinnedMessagesListRef.current;
+        if (pinnedList) {
+            pinnedList.scrollTop = pinnedList.scrollHeight;
+        }
+    }, [showPinnedMessages, pinnedMessages.length]);
 
 
     /* ---------------- TYPING INDICATOR (contacts only) ---------------- */
@@ -197,8 +341,8 @@ export default function ChatPage({ user }) {
     useEffect(() => {
         if (!contactChatId || !user?.uid) return;
         const readDocRef = doc(db, "readReceipts", contactChatId);
-        setDoc(readDocRef, { [user.uid]: Date.now() }, { merge: true }).catch(() => {});
-    }, [contactChatId, messages.length]);
+        setDoc(readDocRef, { [user.uid]: Date.now() }, { merge: true }).catch(() => { });
+    }, [contactChatId, messages.length, user?.uid]);
 
     // Listen to the peer's read timestamp and show it on our last message
     useEffect(() => {
@@ -276,6 +420,81 @@ export default function ChatPage({ user }) {
 
 
     /* ---------------- MESSAGE ---------------- */
+    function getReplyPreview(message) {
+        if (!message) return "";
+        if (message.type === "image") return "[image]";
+        return message.text || "";
+    }
+
+    function getMessageDisplayName(message) {
+        if (message.senderId === user?.uid) {
+            return message.senderName || (selectedContact ? selectedContact.myDisplayName || mainDisplayName : channelDisplayName);
+        }
+        return message.senderName || selectedContact?.displayName || message.senderEmail?.split("@")[0] || "Unknown";
+    }
+
+    function getMessagePhotoURL(message) {
+        if (message.senderId === user?.uid) {
+            return profile.photoURL || user?.photoURL || "";
+        }
+        return selectedContact?.photoURL || "";
+    }
+
+    function getMessageInitial(message) {
+        const name = getMessageDisplayName(message);
+        return name ? name[0].toUpperCase() : "?";
+    }
+
+    function startReply(message) {
+        setReplyTarget({
+            id: message.id,
+            text: getReplyPreview(message),
+            type: message.type || "text",
+            senderName: message.senderName || "Unknown",
+            senderId: message.senderId || "",
+            image: message.image || "",
+        });
+    }
+
+    function startEditMessage(message) {
+        if (message.type === "image") return;
+        setEditTarget(message.id);
+        setMessageEditValue(message.text || "");
+    }
+
+    function cancelEditMessage() {
+        setEditTarget(null);
+        setMessageEditValue("");
+    }
+
+    async function saveEditedMessage(messageId) {
+        if (!activeCollection || !messageEditValue.trim()) return;
+
+        try {
+            await updateDoc(doc(db, ...activeCollection.split("/"), messageId), {
+                text: messageEditValue.trim(),
+                editedAt: Date.now(),
+            });
+            cancelEditMessage();
+        } catch (err) {
+            console.error("edit failed:", err);
+        }
+    }
+
+    async function togglePinMessage(message) {
+        if (!activeCollection) return;
+
+        try {
+            await setDoc(doc(db, ...activeCollection.split("/"), message.id), {
+                pinned: !message.pinned,
+                pinnedAt: !message.pinned ? Date.now() : null,
+                pinnedBy: !message.pinned ? user?.uid || "" : null,
+            }, { merge: true });
+        } catch (err) {
+            console.error("pin failed:", err);
+        }
+    }
+
     async function sendMessage() {
         if (!input.trim() || !activeCollection) return;
         if (CELESTIALS.includes(input.trim())) {
@@ -294,8 +513,12 @@ export default function ChatPage({ user }) {
                 time: Date.now(),
                 senderId: user?.uid || "anonymous",
                 senderEmail: user?.email || "",
-                senderName: user?.displayName || user?.email?.split("@")[0] || "Anonymous"
+                senderName: selectedContact
+                    ? selectedContact.myDisplayName || mainDisplayName
+                    : channelDisplayName,
+                replyTo: replyTarget || null,
             });
+            setReplyTarget(null);
             setEnergy((e) => Math.min(e + 5, 100));
         } catch (error) {
             console.error("Failed to send message:", error);
@@ -310,6 +533,131 @@ export default function ChatPage({ user }) {
             await deleteDoc(doc(db, ...activeCollection.split("/"), messageId));
         } catch (err) {
             console.error("delete failed:", err);
+        }
+    }
+
+    async function saveProfile() {
+        if (!user?.uid) return;
+        const displayName = profileForm.displayName.trim() || user.email?.split("@")[0] || "Traveler";
+        const photoURL = profileForm.photoURL.trim();
+
+        try {
+            if (auth.currentUser) {
+                await updateProfile(auth.currentUser, { displayName, photoURL });
+            }
+
+            await setDoc(doc(db, "users", user.uid), {
+                displayName,
+                searchName: displayName.toLowerCase(),
+                photoURL,
+                lastActive: Date.now()
+            }, { merge: true });
+        } catch (err) {
+            console.error("Failed to save profile:", err);
+        }
+    }
+
+    async function updateUserStatus(nextStatus) {
+        if (!user?.uid) return;
+        try {
+            await setDoc(doc(db, "users", user.uid), {
+                status: nextStatus,
+                lastActive: Date.now()
+            }, { merge: true });
+        } catch (err) {
+            console.error("Failed to update status:", err);
+        }
+    }
+
+    async function saveContactNames() {
+        if (!user?.uid || !selectedContact?.uid) return;
+
+        const nickname = contactForm.nickname.trim();
+        const myDisplayName = contactForm.displayName.trim();
+
+        try {
+            await setDoc(doc(db, "users", user.uid, "contacts", selectedContact.uid), {
+                nickname,
+                myDisplayName,
+                updatedAt: Date.now()
+            }, { merge: true });
+            setSelectedContact((prev) => prev ? {
+                ...prev,
+                nickname,
+                myDisplayName,
+                displayName: nickname || prev.contactDisplayName || prev.displayName,
+            } : prev);
+        } catch (err) {
+            console.error("Failed to save contact names:", err);
+        }
+    }
+
+    async function archiveSelectedContact() {
+        if (!user?.uid || !selectedContact?.uid) return;
+
+        try {
+            await setDoc(doc(db, "users", user.uid, "contacts", selectedContact.uid), {
+                archived: true,
+                archivedAt: Date.now()
+            }, { merge: true });
+            setSelectedContact(null);
+            setMessages([]);
+            setShowRightPanel(false);
+        } catch (err) {
+            console.error("Failed to archive contact:", err);
+        }
+    }
+
+    async function deleteSelectedContactForever() {
+        if (!user?.uid || !selectedContact?.uid) return;
+
+        const peerUid = selectedContact.uid;
+        const chatId = getContactChatId(user.uid, peerUid);
+        const requestId = getContactChatId(user.uid, peerUid);
+
+        try {
+            const messagesSnap = await getDocs(collection(db, "chats", chatId, "messages"));
+            const messageDocs = messagesSnap.docs;
+
+            for (let i = 0; i < messageDocs.length; i += 450) {
+                const batch = writeBatch(db);
+                messageDocs.slice(i, i + 450).forEach((messageDoc) => {
+                    batch.delete(messageDoc.ref);
+                });
+                await batch.commit();
+            }
+
+            const cleanupBatch = writeBatch(db);
+            cleanupBatch.delete(doc(db, "users", user.uid, "contacts", peerUid));
+            cleanupBatch.delete(doc(db, "users", peerUid, "contacts", user.uid));
+            cleanupBatch.delete(doc(db, "contactRequests", requestId));
+            cleanupBatch.delete(doc(db, "typing", chatId));
+            cleanupBatch.delete(doc(db, "readReceipts", chatId));
+            await cleanupBatch.commit();
+
+            setSelectedContact(null);
+            setMessages([]);
+            setShowRightPanel(false);
+            setContactAction(null);
+        } catch (err) {
+            console.error("Failed to delete contact forever:", err);
+        }
+    }
+
+    async function saveChannelSettings() {
+        if (!user?.uid || !selectedUser) return;
+
+        const name = channelForm.name.trim() || selectedUser;
+        const displayName = channelForm.displayName.trim();
+
+        try {
+            await setDoc(doc(db, "users", user.uid, "channels", selectedUser), {
+                name,
+                displayName,
+                updatedAt: Date.now()
+            }, { merge: true });
+        } catch (err) {
+            console.error("Failed to save channel settings:", err);
         }
     }
 
@@ -329,13 +677,13 @@ export default function ChatPage({ user }) {
             return;
         }
 
-        setUploadStatus(`[1/3] Uploading to Cloudinary (file: ${file.name}, size: ${Math.round(file.size/1024)}KB)...`);
+        setUploadStatus(`[1/3] Uploading to Cloudinary (file: ${file.name}, size: ${Math.round(file.size / 1024)}KB)...`);
         let imageUrl = "";
         try {
             const uploadPromise = uploadToCloudinary(file);
             const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Cloudinary upload timed out after 30 seconds")), 30000));
             imageUrl = await Promise.race([uploadPromise, timeoutPromise]);
-            
+
             if (!imageUrl) throw new Error("Cloudinary returned empty URL");
             setUploadStatus(`[2/3] Got image URL. Saving to Firestore (path: ${activeCollection})...`);
         } catch (cloudErr) {
@@ -352,12 +700,16 @@ export default function ChatPage({ user }) {
                 time: Date.now(),
                 senderId: user?.uid || "anonymous",
                 senderEmail: user?.email || "",
-                senderName: user?.displayName || user?.email?.split("@")[0] || "Anonymous"
+                senderName: selectedContact
+                    ? selectedContact.myDisplayName || mainDisplayName
+                    : channelDisplayName,
+                replyTo: replyTarget || null,
             };
             const addPromise = addDoc(collection(db, ...activeCollection.split("/")), docData);
             const dbTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Firestore timed out after 15 seconds")), 15000));
             const docRef = await Promise.race([addPromise, dbTimeout]);
-            
+
+            setReplyTarget(null);
             setEnergy((e) => Math.min(e + 5, 100));
             setUploadStatus(`[3/3] SUCCESS! Saved as doc: ${docRef.id}`);
             setTimeout(() => setUploadStatus(""), 4000);
@@ -484,12 +836,6 @@ export default function ChatPage({ user }) {
         const baseDim = Math.min(age * 0.12, 0.75);
         return 1 - baseDim;
     }
-    const typingName =
-        selectedContact?.displayName ||
-        selectedContact?.email?.split("@")[0] ||
-        selectedUser;
-
-
     return (
         <div
             style={{
@@ -634,6 +980,7 @@ export default function ChatPage({ user }) {
                                     {editingUser === u ? (
                                         <input
                                             value={editValue}
+                                            onChange={(e) => setEditValue(e.target.value)}
 
                                             onKeyDown={(e) => e.key === "Enter" && saveRename(u)}
                                             style={{
@@ -646,7 +993,7 @@ export default function ChatPage({ user }) {
                                         />
                                     ) : (
                                         <span style={{ cursor: "pointer" }}>
-                                            {u}
+                                            {channelSettings[u]?.name || u}
                                         </span>
                                     )}
 
@@ -723,6 +1070,69 @@ export default function ChatPage({ user }) {
                     >
                         ● {user?.displayName || user?.email?.split("@")[0] || "Traveler"}
                     </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 6, marginBottom: 8 }}>
+                        <input
+                            value={profileForm.displayName}
+                            onChange={(e) => setProfileForm((prev) => ({ ...prev, displayName: e.target.value }))}
+                            placeholder="display name"
+                            style={{
+                                padding: "7px 8px",
+                                borderRadius: 7,
+                                border: "1px solid rgba(255,255,255,0.15)",
+                                background: "rgba(0,0,0,0.45)",
+                                color: "white",
+                                fontSize: 10,
+                                fontFamily: "monospace"
+                            }}
+                        />
+                        <input
+                            value={profileForm.photoURL}
+                            onChange={(e) => setProfileForm((prev) => ({ ...prev, photoURL: e.target.value }))}
+                            placeholder="profile photo url"
+                            style={{
+                                padding: "7px 8px",
+                                borderRadius: 7,
+                                border: "1px solid rgba(255,255,255,0.15)",
+                                background: "rgba(0,0,0,0.45)",
+                                color: "white",
+                                fontSize: 10,
+                                fontFamily: "monospace"
+                            }}
+                        />
+                        <select
+                            value={profile.status}
+                            onChange={(e) => updateUserStatus(e.target.value)}
+                            style={{
+                                padding: "7px 8px",
+                                borderRadius: 7,
+                                border: `1px solid ${statusColor(profile.status)}`,
+                                background: "rgba(0,0,0,0.75)",
+                                color: "white",
+                                fontSize: 10,
+                                fontFamily: "monospace"
+                            }}
+                        >
+                            {STATUS_OPTIONS.map((option) => (
+                                <option key={option.value} value={option.value}>{option.label}</option>
+                            ))}
+                        </select>
+                        <button
+                            onClick={saveProfile}
+                            style={{
+                                width: "100%",
+                                padding: "7px 10px",
+                                borderRadius: 8,
+                                background: "rgba(255,255,255,0.08)",
+                                border: `1px solid ${c1}`,
+                                color: "white",
+                                fontSize: 10,
+                                cursor: "pointer",
+                                fontFamily: "monospace"
+                            }}
+                        >
+                            SAVE PROFILE
+                        </button>
+                    </div>
                     <button
                         onClick={handleSignOut}
                         style={{
@@ -762,11 +1172,11 @@ export default function ChatPage({ user }) {
             >
                 <div>
                     <div style={{ fontWeight: "bold" }}>
-                        {selectedContact ? selectedContact.displayName : selectedUser}
+                        {selectedContact ? selectedContact.displayName : selectedChannelName}
                     </div>
-                    <div style={{ fontSize: 11, color: c2 }}>
+                    <div style={{ fontSize: 11, color: selectedContact ? statusColor(selectedContact.status) : c2 }}>
                         {selectedContact
-                            ? (selectedContact.status === "online" ? "online" : "offline")
+                            ? selectedContact.status || "offline"
                             : `energy: ${energy}`
                         }
                     </div>
@@ -808,14 +1218,174 @@ export default function ChatPage({ user }) {
                     transition: "all 0.3s ease"
                 }}
             >
+                {false && messages.some((message) => message.pinned) && (
+                    <div style={{
+                        marginBottom: 12,
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 6,
+                    }}>
+                        {messages
+                            .filter((message) => message.pinned)
+                            .sort((a, b) => (b.pinnedAt || 0) - (a.pinnedAt || 0))
+                            .slice(0, 3)
+                            .map((message) => (
+                                <div
+                                    key={`pinned-${message.id}`}
+                                    style={{
+                                        padding: "8px 10px",
+                                        borderRadius: 10,
+                                        border: `1px solid ${c1}`,
+                                        background: "rgba(255,255,255,0.06)",
+                                        fontFamily: "monospace",
+                                        fontSize: 11,
+                                        color: "white",
+                                        display: "flex",
+                                        justifyContent: "space-between",
+                                        gap: 10
+                                    }}
+                                >
+                                    <span style={{
+                                        overflow: "hidden",
+                                        textOverflow: "ellipsis",
+                                        whiteSpace: "nowrap"
+                                    }}>
+                                        PINNED · {message.senderName}: {getReplyPreview(message)}
+                                    </span>
+                                    <button
+                                        onClick={() => togglePinMessage(message)}
+                                        style={{
+                                            border: "none",
+                                            background: "transparent",
+                                            color: c2,
+                                            cursor: "pointer",
+                                            fontSize: 10,
+                                            fontFamily: "monospace"
+                                        }}
+                                    >
+                                        unpin
+                                    </button>
+                                </div>
+                            ))}
+                    </div>
+                )}
                 <div
                     style={{
                         marginBottom: 12,
                         position: "sticky",
                         top: 0,
-                        zIndex: 10
+                        zIndex: 10,
+                        display: "grid",
+                        gridTemplateColumns: "minmax(220px, 0.6fr) minmax(260px, 1.4fr)",
+                        gap: 10,
+                        alignItems: "start"
                     }}
                 >
+                    <div style={{ position: "relative" }}>
+                        <button
+                            onClick={() => setShowPinnedMessages((open) => !open)}
+                            style={{
+                                width: "100%",
+                                padding: "10px 12px",
+                                borderRadius: 10,
+                                border: `1px solid ${c1}`,
+                                background: "rgba(0,0,0,0.75)",
+                                color: "white",
+                                fontSize: "12px",
+                                fontFamily: "monospace",
+                                cursor: "pointer",
+                                display: "flex",
+                                justifyContent: "space-between",
+                                alignItems: "center",
+                                gap: 10
+                            }}
+                        >
+                            <span>PINNED MESSAGES ({pinnedMessages.length})</span>
+                            <span style={{ color: c2 }}>{showPinnedMessages ? "^" : "v"}</span>
+                        </button>
+
+                        {showPinnedMessages && (
+                            <div ref={pinnedMessagesListRef} style={{
+                                position: "absolute",
+                                top: "calc(100% + 8px)",
+                                left: 0,
+                                right: 0,
+                                maxHeight: 220,
+                                overflowY: "auto",
+                                padding: 8,
+                                borderRadius: 10,
+                                border: `1px solid ${c1}`,
+                                background: "rgba(0,0,0,0.92)",
+                                boxShadow: `0 0 22px ${c1}30`,
+                                display: "flex",
+                                flexDirection: "column",
+                                gap: 8
+                            }}>
+                                {pinnedMessages.length === 0 ? (
+                                    <div style={{
+                                        padding: "12px 10px",
+                                        fontFamily: "monospace",
+                                        fontSize: 11,
+                                        color: "rgba(255,255,255,0.55)",
+                                        textAlign: "center"
+                                    }}>
+                                        NO PINNED MESSAGES
+                                    </div>
+                                ) : (
+                                    pinnedMessages.map((message) => (
+                                            <div
+                                                key={`pinned-${message.id}`}
+                                                style={{
+                                                    padding: "8px 10px",
+                                                    borderRadius: 8,
+                                                    border: "1px solid rgba(255,255,255,0.12)",
+                                                    background: "rgba(255,255,255,0.05)",
+                                                    color: "white",
+                                                    fontFamily: "monospace",
+                                                    fontSize: 11,
+                                                    display: "grid",
+                                                    gap: 4
+                                                }}
+                                            >
+                                                <div style={{
+                                                    display: "flex",
+                                                    justifyContent: "space-between",
+                                                    gap: 8,
+                                                    opacity: 0.65,
+                                                    fontSize: 9
+                                                }}>
+                                                    <span>{message.senderName}</span>
+                                                    <span>{new Date(message.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+                                                </div>
+                                                <div style={{
+                                                    overflow: "hidden",
+                                                    textOverflow: "ellipsis",
+                                                    whiteSpace: "nowrap"
+                                                }}>
+                                                    {getReplyPreview(message)}
+                                                </div>
+                                                <button
+                                                    onClick={() => togglePinMessage(message)}
+                                                    style={{
+                                                        justifySelf: "end",
+                                                        border: "none",
+                                                        background: "transparent",
+                                                        color: c2,
+                                                        cursor: "pointer",
+                                                        fontSize: 10,
+                                                        fontFamily: "monospace",
+                                                        padding: 0
+                                                    }}
+                                                >
+                                                    unpin
+                                                </button>
+                                            </div>
+                                    ))
+                                )}
+                            </div>
+                        )}
+                    </div>
+
                     <input
                         value={search}
                         onChange={(e) => setSearch(e.target.value)}
@@ -842,6 +1412,10 @@ export default function ChatPage({ user }) {
                     filteredMessages.forEach((m, idx) => { if (m.senderId === user?.uid) lastMeIdx = idx; });
                     return filteredMessages.map((m, i) => {
                         const isMe = m.senderId === user?.uid;
+                        const nextMessage = filteredMessages[i + 1];
+                        const showMessageIdentity = !nextMessage || nextMessage.senderId !== m.senderId;
+                        const messagePhotoURL = getMessagePhotoURL(m);
+                        const messageDisplayName = getMessageDisplayName(m);
                         return (
                             <div
                                 key={m.id}
@@ -857,15 +1431,62 @@ export default function ChatPage({ user }) {
                                     transition: "opacity 0.25s ease",
                                 }}
                             >
-                                {!isMe && (
+                                {showMessageIdentity && (
                                     <div style={{
-                                        fontSize: "10px",
-                                        opacity: 0.5,
-                                        marginBottom: "4px",
+                                        display: "flex",
+                                        alignItems: "center",
+                                        justifyContent: isMe ? "flex-end" : "flex-start",
+                                        gap: 8,
+                                        marginBottom: 6,
                                         fontFamily: "monospace",
-                                        marginLeft: "8px"
+                                        fontSize: 11,
+                                        color: "rgba(255,255,255,0.72)"
                                     }}>
-                                        {m.senderName}
+                                        {!isMe && (
+                                            <div style={{
+                                                width: 26,
+                                                height: 26,
+                                                borderRadius: "50%",
+                                                border: `1px solid ${c1}`,
+                                                background: "rgba(255,255,255,0.08)",
+                                                overflow: "hidden",
+                                                display: "flex",
+                                                alignItems: "center",
+                                                justifyContent: "center",
+                                                color: c2,
+                                                fontWeight: "bold",
+                                                flex: "0 0 auto"
+                                            }}>
+                                                {messagePhotoURL ? (
+                                                    <img src={messagePhotoURL} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                                                ) : (
+                                                    getMessageInitial(m)
+                                                )}
+                                            </div>
+                                        )}
+                                        <span>{messageDisplayName}</span>
+                                        {isMe && (
+                                            <div style={{
+                                                width: 26,
+                                                height: 26,
+                                                borderRadius: "50%",
+                                                border: `1px solid ${c1}`,
+                                                background: "rgba(255,255,255,0.08)",
+                                                overflow: "hidden",
+                                                display: "flex",
+                                                alignItems: "center",
+                                                justifyContent: "center",
+                                                color: c2,
+                                                fontWeight: "bold",
+                                                flex: "0 0 auto"
+                                            }}>
+                                                {messagePhotoURL ? (
+                                                    <img src={messagePhotoURL} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                                                ) : (
+                                                    getMessageInitial(m)
+                                                )}
+                                            </div>
+                                        )}
                                     </div>
                                 )}
 
@@ -888,7 +1509,83 @@ export default function ChatPage({ user }) {
                                         textAlign: "left"
                                     }}
                                 >
-                                    {m.type === "image" ? (
+                                    {m.replyTo && (
+                                        <div style={{
+                                            padding: "6px 8px",
+                                            marginBottom: 8,
+                                            borderLeft: `2px solid ${c2}`,
+                                            background: "rgba(255,255,255,0.05)",
+                                            borderRadius: 6,
+                                            fontFamily: "monospace",
+                                            fontSize: 10,
+                                            opacity: 0.85,
+                                            maxWidth: "100%",
+                                            overflow: "hidden"
+                                        }}>
+                                            <div style={{ color: c2, marginBottom: 2 }}>
+                                                replying to {m.replyTo.senderName || "Unknown"}
+                                            </div>
+                                            <div style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                                                {m.replyTo.text || (m.replyTo.type === "image" ? "[image]" : "")}
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {editTarget === m.id ? (
+                                        <div style={{ display: "grid", gap: 8, minWidth: 220 }}>
+                                            <input
+                                                value={messageEditValue}
+                                                onChange={(e) => setMessageEditValue(e.target.value)}
+                                                onKeyDown={(e) => {
+                                                    if (e.key === "Enter") saveEditedMessage(m.id);
+                                                    if (e.key === "Escape") cancelEditMessage();
+                                                }}
+                                                autoFocus
+                                                style={{
+                                                    padding: "8px 10px",
+                                                    borderRadius: 8,
+                                                    border: `1px solid ${c1}`,
+                                                    background: "rgba(0,0,0,0.5)",
+                                                    color: "white",
+                                                    fontFamily: "monospace"
+                                                }}
+                                            />
+                                            <div style={{ display: "flex", gap: 8 }}>
+                                                <button
+                                                    onClick={() => saveEditedMessage(m.id)}
+                                                    style={{
+                                                        flex: 1,
+                                                        border: "none",
+                                                        borderRadius: 6,
+                                                        background: `linear-gradient(135deg, ${c1}, ${c2})`,
+                                                        color: "white",
+                                                        cursor: "pointer",
+                                                        fontSize: 10,
+                                                        fontFamily: "monospace",
+                                                        padding: 6
+                                                    }}
+                                                >
+                                                    save
+                                                </button>
+                                                <button
+                                                    onClick={cancelEditMessage}
+                                                    style={{
+                                                        flex: 1,
+                                                        border: "1px solid rgba(255,255,255,0.2)",
+                                                        borderRadius: 6,
+                                                        background: "transparent",
+                                                        color: "white",
+                                                        cursor: "pointer",
+                                                        fontSize: 10,
+                                                        fontFamily: "monospace",
+                                                        padding: 6
+                                                    }}
+                                                >
+                                                    cancel
+                                                </button>
+                                            </div>
+                                        </div>
+                                    ) : m.type === "image" ? (
                                         <img
                                             src={m.image}
                                             alt="uploaded"
@@ -901,7 +1598,14 @@ export default function ChatPage({ user }) {
                                             }}
                                         />
                                     ) : (
-                                        m.text
+                                        <>
+                                            {m.text}
+                                            {m.editedAt && (
+                                                <span style={{ fontSize: 9, opacity: 0.45, marginLeft: 6 }}>
+                                                    edited
+                                                </span>
+                                            )}
+                                        </>
                                     )}
 
 
@@ -924,26 +1628,73 @@ export default function ChatPage({ user }) {
                                     </div>
 
 
-                                    {isMe && (
+                                    <div style={{
+                                        marginTop: 6,
+                                        display: "flex",
+                                        gap: 8,
+                                        justifyContent: isMe ? "flex-end" : "flex-start",
+                                        flexWrap: "wrap"
+                                    }}>
                                         <button
-                                            onClick={() => setDeleteTarget(m.id)}
+                                            onClick={() => startReply(m)}
                                             style={{
-                                                marginTop: 6,
                                                 fontSize: "9px",
                                                 background: "transparent",
                                                 border: "none",
-                                                color: "#ff4d4d",
+                                                color: c2,
                                                 cursor: "pointer",
-                                                fontFamily: "monospace",
-                                                display: "block"
+                                                fontFamily: "monospace"
                                             }}
                                         >
-                                            delete
+                                            reply
                                         </button>
-                                    )}
+                                        <button
+                                            onClick={() => togglePinMessage(m)}
+                                            style={{
+                                                fontSize: "9px",
+                                                background: "transparent",
+                                                border: "none",
+                                                color: m.pinned ? c1 : "rgba(255,255,255,0.65)",
+                                                cursor: "pointer",
+                                                fontFamily: "monospace"
+                                            }}
+                                        >
+                                            {m.pinned ? "unpin" : "pin"}
+                                        </button>
+                                        {isMe && m.type !== "image" && (
+                                            <button
+                                                onClick={() => startEditMessage(m)}
+                                                style={{
+                                                    fontSize: "9px",
+                                                    background: "transparent",
+                                                    border: "none",
+                                                    color: "rgba(255,255,255,0.75)",
+                                                    cursor: "pointer",
+                                                    fontFamily: "monospace"
+                                                }}
+                                            >
+                                                edit
+                                            </button>
+                                        )}
+                                        {isMe && (
+                                            <button
+                                                onClick={() => setDeleteTarget(m.id)}
+                                                style={{
+                                                    fontSize: "9px",
+                                                    background: "transparent",
+                                                    border: "none",
+                                                    color: "#ff4d4d",
+                                                    cursor: "pointer",
+                                                    fontFamily: "monospace"
+                                                }}
+                                            >
+                                                delete
+                                            </button>
+                                        )}
+                                    </div>
 
 
-                                {/* Read receipt: only on last message sent by me, in contacts chats */}
+                                    {/* Read receipt: only on last message sent by me, in contacts chats */}
                                     {isMe && i === lastMeIdx && selectedContact && peerReadTs >= m.time && (
                                         <div style={{
                                             fontSize: "9px",
@@ -977,7 +1728,7 @@ export default function ChatPage({ user }) {
                         }}
                     >
                         <span style={{ display: "inline-flex", gap: 3 }}>
-                            {[0,1,2].map(i => (
+                            {[0, 1, 2].map(i => (
                                 <span key={i} style={{
                                     width: 5, height: 5,
                                     borderRadius: "50%",
@@ -1012,6 +1763,7 @@ export default function ChatPage({ user }) {
                         ● {uploadStatus}
                     </div>
                 )}
+                <div ref={messagesEndRef} />
             </div>
 
 
@@ -1095,6 +1847,52 @@ export default function ChatPage({ user }) {
                 </div>
             )}
 
+            {replyTarget && (
+                <div
+                    style={{
+                        position: "absolute",
+                        bottom: 78,
+                        left: `calc(280px + (100% - 280px - ${showRightPanel ? "320px" : "20px"}) / 2)`,
+                        transform: "translateX(-50%)",
+                        width: "55%",
+                        padding: "8px 12px",
+                        borderRadius: 10,
+                        border: `1px solid ${c1}`,
+                        background: "rgba(0,0,0,0.75)",
+                        color: "white",
+                        fontFamily: "monospace",
+                        fontSize: 11,
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: 12,
+                        zIndex: 8
+                    }}
+                >
+                    <div style={{ overflow: "hidden" }}>
+                        <div style={{ color: c2, marginBottom: 2 }}>
+                            replying to {replyTarget.senderName}
+                        </div>
+                        <div style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                            {replyTarget.text || (replyTarget.type === "image" ? "[image]" : "")}
+                        </div>
+                    </div>
+                    <button
+                        onClick={() => setReplyTarget(null)}
+                        style={{
+                            border: "none",
+                            background: "transparent",
+                            color: "white",
+                            cursor: "pointer",
+                            fontFamily: "monospace",
+                            fontSize: 12
+                        }}
+                    >
+                        cancel
+                    </button>
+                </div>
+            )}
+
 
 
 
@@ -1128,7 +1926,7 @@ export default function ChatPage({ user }) {
                         // Write typing status to Firestore (contacts only)
                         if (contactChatId) {
                             const typingDocRef = doc(db, "typing", contactChatId);
-                            setDoc(typingDocRef, { [user.uid]: Date.now() }, { merge: true }).catch(() => {});
+                            setDoc(typingDocRef, { [user.uid]: Date.now() }, { merge: true }).catch(() => { });
                         }
 
                         clearTimeout(typingTimeoutRef.current);
@@ -1138,7 +1936,7 @@ export default function ChatPage({ user }) {
                             // Clear typing status after 4s of inactivity
                             if (contactChatId) {
                                 const typingDocRef = doc(db, "typing", contactChatId);
-                                setDoc(typingDocRef, { [user.uid]: 0 }, { merge: true }).catch(() => {});
+                                setDoc(typingDocRef, { [user.uid]: 0 }, { merge: true }).catch(() => { });
                             }
                         }, 1200);
                     }}
@@ -1239,8 +2037,22 @@ export default function ChatPage({ user }) {
                             fontSize: "36px",
                             fontWeight: "bold",
                             marginTop: 20,
-                            color: c2
+                            color: selectedContact.photoURL ? "transparent" : c2,
+                            overflow: "hidden",
+                            position: "relative"
                         }}>
+                            {selectedContact.photoURL && (
+                                <img
+                                    src={selectedContact.photoURL}
+                                    alt=""
+                                    style={{
+                                        width: "100%",
+                                        height: "100%",
+                                        objectFit: "cover",
+                                        position: "absolute"
+                                    }}
+                                />
+                            )}
                             {selectedContact.displayName ? selectedContact.displayName[0].toUpperCase() : "👤"}
                         </div>
 
@@ -1250,7 +2062,7 @@ export default function ChatPage({ user }) {
 
                         <div style={{
                             fontSize: "11px",
-                            color: selectedContact.status === "online" ? "#4de1ff" : "#888",
+                            color: statusColor(selectedContact.status),
                             marginBottom: 20
                         }}>
                             ● {selectedContact.status === "online" ? "ONLINE" : "OFFLINE"}
@@ -1262,6 +2074,82 @@ export default function ChatPage({ user }) {
 
 
 
+
+                        <div style={{ width: "100%", display: "grid", gap: 8, marginBottom: 14 }}>
+                            <input
+                                value={contactForm.nickname}
+                                onChange={(e) => setContactForm((prev) => ({ ...prev, nickname: e.target.value }))}
+                                placeholder="nickname for this contact"
+                                style={{
+                                    padding: "8px 10px",
+                                    borderRadius: 8,
+                                    border: "1px solid rgba(255,255,255,0.15)",
+                                    background: "rgba(0,0,0,0.45)",
+                                    color: "white",
+                                    fontSize: 11,
+                                    fontFamily: "monospace"
+                                }}
+                            />
+                            <input
+                                value={contactForm.displayName}
+                                onChange={(e) => setContactForm((prev) => ({ ...prev, displayName: e.target.value }))}
+                                placeholder="my name in this chat"
+                                style={{
+                                    padding: "8px 10px",
+                                    borderRadius: 8,
+                                    border: "1px solid rgba(255,255,255,0.15)",
+                                    background: "rgba(0,0,0,0.45)",
+                                    color: "white",
+                                    fontSize: 11,
+                                    fontFamily: "monospace"
+                                }}
+                            />
+                            <button
+                                onClick={saveContactNames}
+                                style={{
+                                    padding: "8px 10px",
+                                    borderRadius: 8,
+                                    border: `1px solid ${c1}`,
+                                    background: "rgba(255,255,255,0.08)",
+                                    color: "white",
+                                    cursor: "pointer",
+                                    fontSize: 11,
+                                    fontFamily: "monospace"
+                                }}
+                            >
+                                SAVE CONTACT NAMES
+                            </button>
+                            <button
+                                onClick={archiveSelectedContact}
+                                style={{
+                                    padding: "8px 10px",
+                                    borderRadius: 8,
+                                    border: "1px solid rgba(255,255,255,0.2)",
+                                    background: "rgba(255,255,255,0.04)",
+                                    color: "white",
+                                    cursor: "pointer",
+                                    fontSize: 11,
+                                    fontFamily: "monospace"
+                                }}
+                            >
+                                ARCHIVE CONTACT
+                            </button>
+                            <button
+                                onClick={() => setContactAction("deleteForever")}
+                                style={{
+                                    padding: "8px 10px",
+                                    borderRadius: 8,
+                                    border: "1px solid #ff4d5e",
+                                    background: "rgba(255,77,94,0.12)",
+                                    color: "white",
+                                    cursor: "pointer",
+                                    fontSize: 11,
+                                    fontFamily: "monospace"
+                                }}
+                            >
+                                DELETE CONTACT + MESSAGES
+                            </button>
+                        </div>
 
                         <div style={{ width: "100%", borderTop: "1px solid rgba(255,255,255,0.1)", paddingTop: 15, fontSize: "12px", display: "flex", flexDirection: "column", gap: 12 }}>
                             <div>
@@ -1300,7 +2188,7 @@ export default function ChatPage({ user }) {
                         </div>
 
                         <h3 style={{ margin: "16px 0 4px 0", color: "white", fontSize: "18px" }}>
-                            {selectedUser}
+                            {selectedChannelName}
                         </h3>
 
                         <div style={{
@@ -1309,6 +2197,52 @@ export default function ChatPage({ user }) {
                             marginBottom: 20
                         }}>
                             PUBLIC NODE
+                        </div>
+
+                        <div style={{ width: "100%", display: "grid", gap: 8, marginBottom: 14 }}>
+                            <input
+                                value={channelForm.name}
+                                onChange={(e) => setChannelForm((prev) => ({ ...prev, name: e.target.value }))}
+                                placeholder="channel name"
+                                style={{
+                                    padding: "8px 10px",
+                                    borderRadius: 8,
+                                    border: "1px solid rgba(255,255,255,0.15)",
+                                    background: "rgba(0,0,0,0.45)",
+                                    color: "white",
+                                    fontSize: 11,
+                                    fontFamily: "monospace"
+                                }}
+                            />
+                            <input
+                                value={channelForm.displayName}
+                                onChange={(e) => setChannelForm((prev) => ({ ...prev, displayName: e.target.value }))}
+                                placeholder="my name in this channel"
+                                style={{
+                                    padding: "8px 10px",
+                                    borderRadius: 8,
+                                    border: "1px solid rgba(255,255,255,0.15)",
+                                    background: "rgba(0,0,0,0.45)",
+                                    color: "white",
+                                    fontSize: 11,
+                                    fontFamily: "monospace"
+                                }}
+                            />
+                            <button
+                                onClick={saveChannelSettings}
+                                style={{
+                                    padding: "8px 10px",
+                                    borderRadius: 8,
+                                    border: `1px solid ${c1}`,
+                                    background: "rgba(255,255,255,0.08)",
+                                    color: "white",
+                                    cursor: "pointer",
+                                    fontSize: 11,
+                                    fontFamily: "monospace"
+                                }}
+                            >
+                                SAVE CHANNEL
+                            </button>
                         </div>
 
 
@@ -1341,6 +2275,73 @@ export default function ChatPage({ user }) {
             </div>
             {deleteTarget && (
                 <div> ... your modal ... </div>
+            )}
+
+            {contactAction === "deleteForever" && selectedContact && (
+                <div
+                    style={{
+                        position: "fixed",
+                        inset: 0,
+                        background: "rgba(0,0,0,0.68)",
+                        backdropFilter: "blur(12px)",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        zIndex: 10000,
+                        fontFamily: "monospace"
+                    }}
+                    onClick={() => setContactAction(null)}
+                >
+                    <div
+                        onClick={(e) => e.stopPropagation()}
+                        style={{
+                            width: 300,
+                            padding: 20,
+                            borderRadius: 14,
+                            border: "1px solid #ff4d5e",
+                            background: "rgba(20,0,8,0.85)",
+                            color: "white",
+                            textAlign: "center"
+                        }}
+                    >
+                        <div style={{ fontSize: 14, marginBottom: 8 }}>
+                            delete {selectedContact.displayName} forever?
+                        </div>
+                        <div style={{ fontSize: 10, opacity: 0.65, marginBottom: 16, lineHeight: 1.5 }}>
+                            This removes the contact and permanently deletes the shared chat history.
+                        </div>
+                        <div style={{ display: "flex", gap: 10 }}>
+                            <button
+                                onClick={() => setContactAction(null)}
+                                style={{
+                                    flex: 1,
+                                    padding: 8,
+                                    borderRadius: 8,
+                                    border: "1px solid rgba(255,255,255,0.2)",
+                                    background: "transparent",
+                                    color: "white",
+                                    cursor: "pointer"
+                                }}
+                            >
+                                CANCEL
+                            </button>
+                            <button
+                                onClick={deleteSelectedContactForever}
+                                style={{
+                                    flex: 1,
+                                    padding: 8,
+                                    borderRadius: 8,
+                                    border: "none",
+                                    background: "linear-gradient(135deg, #ff4d5e, #ff7ad9)",
+                                    color: "white",
+                                    cursor: "pointer"
+                                }}
+                            >
+                                DELETE
+                            </button>
+                        </div>
+                    </div>
+                </div>
             )}
 
             {/* ENLARGED IMAGE MODAL */}

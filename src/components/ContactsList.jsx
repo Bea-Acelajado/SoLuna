@@ -1,73 +1,59 @@
 import { useEffect, useState } from "react";
 import { db } from "../firebase";
-import {
-    collection, query, where, onSnapshot, doc, getDoc
-} from "firebase/firestore";
+import { collection, onSnapshot, doc } from "firebase/firestore";
 
-export default function ContactsList({ currentUser, selectedContact, onSelectContact, c1, c2 }) {
-    const [contacts, setContacts] = useState([]); // [{ uid, displayName, email, photoURL }]
+const STATUS_COLORS = {
+    online: "#36e68a",
+    idle: "#ffd166",
+    dnd: "#ff4d5e",
+    offline: "#777",
+};
+
+const STATUS_LABELS = {
+    online: "Online",
+    idle: "Idle",
+    dnd: "Do not disturb",
+    offline: "Offline",
+};
+
+export default function ContactsList({ currentUser, selectedContact, onSelectContact, c1 }) {
+    const [contacts, setContacts] = useState([]);
     const [profiles, setProfiles] = useState({});
 
     useEffect(() => {
         if (!currentUser) return;
 
-        // Listen to contactRequests where I am the SENDER and request is accepted
-        const sentQ = query(
-            collection(db, "contactRequests"),
-            where("senderId", "==", currentUser.uid),
-            where("status", "==", "accepted")
+        const contactsRef = collection(db, "users", currentUser.uid, "contacts");
+        const unsubscribe = onSnapshot(
+            contactsRef,
+            (snap) => {
+                const list = snap.docs
+                    .map((docSnap) => {
+                        const data = docSnap.data();
+                        return {
+                            uid: data.contactUid || docSnap.id,
+                            displayName: data.displayName || data.email?.split("@")[0] || "Unknown",
+                            email: data.email || "",
+                            photoURL: data.photoURL || "",
+                            nickname: data.nickname || "",
+                            myDisplayName: data.myDisplayName || "",
+                            archived: data.archived === true,
+                            addedAt: data.addedAt || 0,
+                        };
+                    })
+                    .filter((contact) => !contact.archived)
+                    .sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
+
+                setContacts(list);
+            },
+            (error) => {
+                console.error("Failed to load saved contacts:", error);
+            }
         );
 
-        // Listen to contactRequests where I am the RECEIVER and request is accepted
-        const receivedQ = query(
-            collection(db, "contactRequests"),
-            where("receiverId", "==", currentUser.uid),
-            where("status", "==", "accepted")
-        );
-
-        const seenUids = new Map(); // uid → contact data
-
-        const merge = () => {
-            setContacts(Array.from(seenUids.values()));
-        };
-
-        const unsubSent = onSnapshot(sentQ, (snap) => {
-            snap.forEach((docSnap) => {
-                const data = docSnap.data();
-                // I am the sender → the contact is the receiver
-                seenUids.set(data.receiverId, {
-                    uid: data.receiverId,
-                    displayName: data.receiverName || data.receiverEmail?.split("@")[0] || "Unknown",
-                    email: data.receiverEmail || "",
-                    photoURL: data.receiverPhoto || "",
-                });
-            });
-            // Remove contacts no longer in this snapshot (in case of deletions)
-            // We rebuild from both snapshots on any change
-            merge();
-        });
-
-        const unsubReceived = onSnapshot(receivedQ, (snap) => {
-            snap.forEach((docSnap) => {
-                const data = docSnap.data();
-                // I am the receiver → the contact is the sender
-                seenUids.set(data.senderId, {
-                    uid: data.senderId,
-                    displayName: data.senderName || data.senderEmail?.split("@")[0] || "Unknown",
-                    email: data.senderEmail || "",
-                    photoURL: data.senderPhoto || "",
-                });
-            });
-            merge();
-        });
-
-        return () => {
-            unsubSent();
-            unsubReceived();
-        };
+        return () => unsubscribe();
     }, [currentUser]);
 
-    // Fetch live profiles (for online status) whenever contact list changes
     useEffect(() => {
         if (contacts.length === 0) {
             setProfiles({});
@@ -85,7 +71,7 @@ export default function ContactsList({ currentUser, selectedContact, onSelectCon
             })
         );
 
-        return () => unsubscribers.forEach((u) => u());
+        return () => unsubscribers.forEach((unsubscribe) => unsubscribe());
     }, [contacts]);
 
     const formatLastActive = (timestamp) => {
@@ -107,29 +93,38 @@ export default function ContactsList({ currentUser, selectedContact, onSelectCon
                 CONTACTS ALIGNED
             </div>
             {contacts.map((contact) => {
-                const profile = profiles[contact.uid] || contact;
-                const isOnline = profile.status === "online";
+                const profile = profiles[contact.uid] || {};
+                const status = profile.status || "offline";
+                const displayName = contact.nickname || profile.displayName || contact.displayName;
+                const photoURL = profile.photoURL || contact.photoURL;
                 const isSelected = selectedContact?.uid === contact.uid;
 
                 return (
                     <div
                         key={contact.uid}
-                        onClick={() => onSelectContact({ ...profile, uid: contact.uid })}
+                        onClick={() => onSelectContact({
+                            ...contact,
+                            ...profile,
+                            uid: contact.uid,
+                            contactDisplayName: contact.displayName,
+                            nickname: contact.nickname,
+                            myDisplayName: contact.myDisplayName,
+                            displayName,
+                            photoURL,
+                            status,
+                        })}
                         style={{
                             padding: "10px",
                             marginTop: 6,
                             borderRadius: 10,
                             cursor: "pointer",
-                            background: isSelected
-                                ? `linear-gradient(135deg, ${c1}, ${c2})`
-                                : "transparent",
+                            background: isSelected ? `linear-gradient(135deg, ${c1}, rgba(255,255,255,0.1))` : "transparent",
                             transition: "background 0.3s ease",
                             display: "flex",
                             alignItems: "center",
                             gap: 10
                         }}
                     >
-                        {/* Status Avatar */}
                         <div style={{ position: "relative" }}>
                             <div style={{
                                 width: 32,
@@ -141,9 +136,14 @@ export default function ContactsList({ currentUser, selectedContact, onSelectCon
                                 justifyContent: "center",
                                 alignItems: "center",
                                 fontSize: "14px",
-                                fontWeight: "bold"
+                                fontWeight: "bold",
+                                overflow: "hidden"
                             }}>
-                                {profile.displayName ? profile.displayName[0].toUpperCase() : "👤"}
+                                {photoURL ? (
+                                    <img src={photoURL} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                                ) : (
+                                    displayName ? displayName[0].toUpperCase() : "?"
+                                )}
                             </div>
                             <div style={{
                                 position: "absolute",
@@ -152,12 +152,11 @@ export default function ContactsList({ currentUser, selectedContact, onSelectCon
                                 width: 10,
                                 height: 10,
                                 borderRadius: "50%",
-                                background: isOnline ? "#4de1ff" : "#555",
+                                background: STATUS_COLORS[status] || STATUS_COLORS.offline,
                                 border: "2px solid black"
                             }} />
                         </div>
 
-                        {/* Contact details */}
                         <div style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis" }}>
                             <div style={{
                                 fontSize: "13px",
@@ -167,7 +166,7 @@ export default function ContactsList({ currentUser, selectedContact, onSelectCon
                                 overflow: "hidden",
                                 textOverflow: "ellipsis"
                             }}>
-                                {profile.displayName}
+                                {displayName}
                             </div>
                             <div style={{
                                 fontSize: "9px",
@@ -177,7 +176,7 @@ export default function ContactsList({ currentUser, selectedContact, onSelectCon
                                 overflow: "hidden",
                                 textOverflow: "ellipsis"
                             }}>
-                                {isOnline ? "Online" : `Last active: ${formatLastActive(profile.lastActive)}`}
+                                {STATUS_LABELS[status] || "Offline"} · {status === "offline" ? `Last active: ${formatLastActive(profile.lastActive)}` : contact.email}
                             </div>
                         </div>
                     </div>

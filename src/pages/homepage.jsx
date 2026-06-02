@@ -38,7 +38,7 @@ export default function HomePage({ user, onEnter }) {
 
     async function handleEnter() {
         setStatus("AUTHENTICATING...");
-        
+
         if (!user) {
             try {
                 const provider = new GoogleAuthProvider();

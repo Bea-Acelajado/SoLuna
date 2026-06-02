@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { db } from "../firebase";
-import { collection, query, where, onSnapshot, doc, writeBatch, deleteDoc } from "firebase/firestore";
+import { collection, query, where, onSnapshot, doc, writeBatch, deleteDoc, setDoc } from "firebase/firestore";
 
 export default function ContactRequests({ currentUser, c1, c2 }) {
     const [requests, setRequests] = useState([]);
@@ -43,13 +43,22 @@ export default function ContactRequests({ currentUser, c1, c2 }) {
                 email: request.senderEmail,
                 displayName: senderName,
                 photoURL: request.senderPhoto || "",
+                archived: false,
                 addedAt: Date.now()
             });
 
-            // NOTE: We do NOT write to the sender's subcollection (Firestore rules block cross-user writes).
-            // The sender will see this contact via the accepted contactRequests query in ContactsList.
-
             await batch.commit();
+
+            // Save the reciprocal contact after the request is accepted so both users hydrate on refresh.
+            const senderContactRef = doc(db, "users", request.senderId, "contacts", currentUser.uid);
+            await setDoc(senderContactRef, {
+                contactUid: currentUser.uid,
+                email: currentUser.email,
+                displayName: currentUser.displayName || currentUser.email.split("@")[0],
+                photoURL: currentUser.photoURL || "",
+                archived: false,
+                addedAt: Date.now()
+            }, { merge: true });
         } catch (err) {
             console.error("Error accepting request:", err);
             alert("Failed to accept connection request.");

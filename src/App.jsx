@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { onAuthStateChanged } from "firebase/auth";
 import { auth, db } from "./firebase";
-import { doc, setDoc } from "firebase/firestore";
+import { doc, getDoc, setDoc } from "firebase/firestore";
 import HomePage from "./pages/homepage";
 import ChatPage from "./pages/chatpage";
 
@@ -15,15 +15,18 @@ function App() {
       if (currentUser) {
         try {
           const displayName = currentUser.displayName || currentUser.email.split("@")[0];
+          const userRef = doc(db, "users", currentUser.uid);
+          const existingUser = await getDoc(userRef);
+          const existingStatus = existingUser.exists() ? existingUser.data().status : null;
           await setDoc(
-            doc(db, "users", currentUser.uid),
+            userRef,
             {
               uid: currentUser.uid,
               email: currentUser.email.toLowerCase(),
               displayName,
               searchName: displayName.toLowerCase(),
               photoURL: currentUser.photoURL || "",
-              status: "online",
+              status: existingStatus || "online",
               lastActive: Date.now(),
             },
             { merge: true }
@@ -67,4 +70,4 @@ function App() {
   return <ChatPage user={user} />;
 }
 
-export default App;
+export default App;
